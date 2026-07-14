@@ -79,11 +79,6 @@ public final class DirectCompositionLayer {
      * Push an AHardwareBuffer to the SC layer. The layer is shown atomically
      * with the buffer set (avoids the blank-frame race).
      *
-     * <p>This method is NON-BLOCKING — it applies the transaction and returns
-     * immediately. The actual SurfaceFlinger processing happens asynchronously.
-     * To pace the render thread to vsync, call
-     * {@link #waitForPreviousFrame(long)} BEFORE the next pushBuffer.
-     *
      * @param ahbPtr          The raw AHardwareBuffer* pointer (from
      *                        GPUImage.getHardwareBufferPtr()). Must be non-zero.
      * @param dstX            Destination X in SurfaceView coordinate space.
@@ -105,7 +100,7 @@ public final class DirectCompositionLayer {
      */
     public synchronized boolean pushBuffer(long ahbPtr, int dstX, int dstY,
                                             int dstW, int dstH,
-                                            int acquireFenceFd, boolean opaque) {
+                                            int acquireFenceFd, boolean opaque, boolean pace) {
         if (!attached || nativeSc == 0) {
             if (acquireFenceFd >= 0) {
                 try { android.os.ParcelFileDescriptor.adoptFd(acquireFenceFd).close(); }
@@ -114,30 +109,7 @@ public final class DirectCompositionLayer {
             return false;
         }
         return nativePushBuffer(nativeSc, ahbPtr, dstX, dstY, dstW, dstH,
-                                acquireFenceFd, opaque);
-    }
-
-    /**
-     * Block until the previously-applied ASurfaceTransaction is complete (the
-     * buffer is "observable on display"). This paces the render thread to
-     * SurfaceFlinger's vsync — eliminating the per-frame apply() storm and
-     * ensuring we never queue more than one transaction ahead of SF.
-     *
-     * <p>Uses {@code ASurfaceTransaction_setOnComplete} (API 29+) under the
-     * hood. If that symbol is unavailable (shouldn't happen on API 29+), this
-     * is a no-op (returns true immediately).
-     *
-     * @param timeoutMs Maximum time to wait, in milliseconds. 20ms is a good
-     *                  default (~1 vsync at 60Hz, ~8ms at 120Hz). If the
-     *                  timeout expires, returns false (the caller should
-     *                  proceed anyway — holding the render thread longer risks
-     *                  a worse stall than a queued transaction).
-     * @return true if the previous frame completed within the timeout, false
-     *         on timeout.
-     */
-    public synchronized boolean waitForPreviousFrame(long timeoutMs) {
-        if (!attached || nativeSc == 0) return true;
-        return nativeWaitForPreviousFrame(timeoutMs);
+                                acquireFenceFd, opaque, pace);
     }
 
     /**
@@ -182,7 +154,8 @@ public final class DirectCompositionLayer {
     private native boolean nativePushBuffer(long scPtr, long ahbPtr,
                                              int dstX, int dstY,
                                              int dstW, int dstH,
-                                             int acquireFenceFd, boolean opaque);
+                                             int acquireFenceFd, boolean opaque, boolean pace);
 
-    private native boolean nativeWaitForPreviousFrame(long timeoutMs);
+    // Blocks until SF finishes the previous frame (hardware signal, no CPU polling).
+    public native boolean nativeWaitForPreviousFrame(long timeoutMs);
 }

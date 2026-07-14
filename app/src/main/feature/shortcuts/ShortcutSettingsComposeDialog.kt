@@ -32,9 +32,17 @@ import com.winlator.cmod.R
 import com.winlator.cmod.app.PluviaApp
 import com.winlator.cmod.feature.library.DriveItem
 import com.winlator.cmod.feature.library.EnvVarItem
+import com.winlator.cmod.feature.library.parseEnvVarItems
 import androidx.compose.runtime.getValue
 import com.winlator.cmod.feature.library.GameSettingsCallbacks
 import com.winlator.cmod.feature.library.GameSettingsContent
+import com.winlator.cmod.feature.library.GameSettingsNav
+import com.winlator.cmod.shared.ui.nav.PANE_DIR_ACTIVATE
+import com.winlator.cmod.shared.ui.nav.PaneNavWindowHandlers
+import com.winlator.cmod.shared.ui.nav.bindPaneNav
+import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.Modifier
+import com.winlator.cmod.shared.ui.focus.controllerMenuInput
 import com.winlator.cmod.feature.library.GameSettingsStateHolder
 import com.winlator.cmod.feature.library.WinComponentItem
 import com.winlator.cmod.feature.settings.DXVKConfigUtils
@@ -99,6 +107,8 @@ class ShortcutSettingsComposeDialog private constructor(
         this(activity, shortcut, null)
     private val dialog: Dialog
     private val state = GameSettingsStateHolder()
+    private val nav = GameSettingsNav()
+    private var restorePaneNav: (() -> Unit)? = null
 
     // Java interop references
     private var inputControlsManager: InputControlsManager = InputControlsManager(context)
@@ -163,6 +173,10 @@ class ShortcutSettingsComposeDialog private constructor(
                 }
                 // Blur-behind is applied in show() post-attach to avoid flicker.
             }
+            setOnDismissListener {
+                restorePaneNav?.invoke()
+                restorePaneNav = null
+            }
         }
 
         loadInitialData()
@@ -181,10 +195,8 @@ class ShortcutSettingsComposeDialog private constructor(
                     CompositionLocalProvider(
                         LocalDensity provides Density(defaultDensity.density, fontScale = 1f)
                     ) {
-                        GameSettingsContent(
-                            state = state,
-                            callbacks = createCallbacks()
-                        )
+                        val callbacks = createCallbacks()
+                        GameSettingsContent(state = state, callbacks = callbacks, nav = nav)
                     }
                 }
             }
@@ -403,6 +415,10 @@ class ShortcutSettingsComposeDialog private constructor(
             if (container.isFullscreenStretched) "1" else "0"
         )
         state.fullscreenStretched.value = fullscreenStretched == "1"
+        state.useUnixLibs.value = getShortcutSetting(
+            "useUnixLibs",
+            if (container.isUseUnixLibs) "1" else "0"
+        ) == "1"
 
         // Direct Composition (per-shortcut override of the container setting).
         // Falls back to the container's value when the shortcut doesn't override.
@@ -936,15 +952,11 @@ class ShortcutSettingsComposeDialog private constructor(
             "envVars",
             container?.getEnvVars() ?: Container.DEFAULT_ENV_VARS
         )
-        val envVars = EnvVars(envVarsStr)
-        val items = mutableListOf<EnvVarItem>()
-        for (key in envVars) {
-            items.add(EnvVarItem(key, envVars.get(key)))
-        }
+        val items = parseEnvVarItems(envVarsStr)
         state.envVars.value = items
 
         // Hide SDL2 keys from the user-visible list when the toggle is on.
-        state.sdl2Compatibility.value = envVars.get("SDL_XINPUT_ENABLED") == "1"
+        state.sdl2Compatibility.value = EnvVars(envVarsStr).get("SDL_XINPUT_ENABLED") == "1"
         if (state.sdl2Compatibility.value) {
             state.envVars.value = items.filterNot { item ->
                 sdl2EnvVars.any { it.first == item.key }
@@ -1073,6 +1085,13 @@ class ShortcutSettingsComposeDialog private constructor(
                 Container.EXTRA_DIRECT_COMPOSITION,
                 if (state.directComposition.value) "1" else "0",
                 if (container.isDirectCompositionEnabled()) "1" else "0"
+            )
+
+            // Use UnixLibs
+            hasContainerOverride = hasContainerOverride or saveOverride(
+                "useUnixLibs",
+                if (state.useUnixLibs.value) "1" else "0",
+                if (container.isUseUnixLibs) "1" else "0"
             )
 
             // Win components
@@ -1819,13 +1838,16 @@ class ShortcutSettingsComposeDialog private constructor(
         val bcnEmulation = state.gfxBcnEmulationEntries.value.getOrElse(state.gfxSelectedBcnEmulation.intValue) { "auto" }
         val bcnEmulationType = state.gfxBcnEmulationTypeEntries.value.getOrElse(state.gfxSelectedBcnEmulationType.intValue) { "compute" }
         val bcnEmulationCache = state.gfxBcnEmulationCacheEntries.value.getOrElse(state.gfxSelectedBcnEmulationCache.intValue) { "0" }
+        val transcoder = state.gfxTranscoderEntries.value.getOrElse(state.gfxSelectedTranscoder.intValue) { "cpu" }
+        val quality = state.gfxQualityEntries.value.getOrElse(state.gfxSelectedQuality.intValue) { "low" }
 
         return "vulkanVersion=$vulkanVersion;version=$version;blacklistedExtensions=$blacklisted;" +
                 "maxDeviceMemory=$maxDeviceMemory;presentMode=$presentMode;syncFrame=$syncFrame;" +
                 "disablePresentWait=$disablePresentWait;resourceType=$resourceType;" +
                 "bcnEmulation=$bcnEmulation;bcnEmulationType=$bcnEmulationType;" +
                 "bcnEmulationCache=$bcnEmulationCache;gpuName=$gpuName;" +
-                "compositorPresentMode=$compositorPresentMode"
+                "compositorPresentMode=$compositorPresentMode;" +
+                "transcoder=$transcoder;quality=$quality"
     }
 
     private fun buildDxvkConfigFromState(): String {
@@ -1865,6 +1887,8 @@ class ShortcutSettingsComposeDialog private constructor(
         state.gfxBcnEmulationEntries.value = context.resources.getStringArray(R.array.bcn_emulation_entries).toList()
         state.gfxBcnEmulationTypeEntries.value = context.resources.getStringArray(R.array.bcn_emulation_type_entries).toList()
         state.gfxBcnEmulationCacheEntries.value = context.resources.getStringArray(R.array.bcn_emulation_cache_entries).toList()
+        state.gfxTranscoderEntries.value = context.resources.getStringArray(R.array.wrapper_transcoder_entries).toList()
+        state.gfxQualityEntries.value = context.resources.getStringArray(R.array.wrapper_quality_entries).toList()
 
         val gpuNames = mutableListOf("Device")
         try {
@@ -1892,6 +1916,8 @@ class ShortcutSettingsComposeDialog private constructor(
         selectByValue(state.gfxBcnEmulationEntries.value, config["bcnEmulation"] ?: "none", state.gfxSelectedBcnEmulation)
         selectByValue(state.gfxBcnEmulationTypeEntries.value, config["bcnEmulationType"] ?: "compute", state.gfxSelectedBcnEmulationType)
         selectByValue(state.gfxBcnEmulationCacheEntries.value, config["bcnEmulationCache"] ?: "0", state.gfxSelectedBcnEmulationCache)
+        selectByValue(state.gfxTranscoderEntries.value, config["transcoder"] ?: "cpu", state.gfxSelectedTranscoder)
+        selectByValue(state.gfxQualityEntries.value, config["quality"] ?: "low", state.gfxSelectedQuality)
 
         state.gfxSyncFrame.value = config["syncFrame"] == "1"
         state.gfxDisablePresentWait.value = config["disablePresentWait"] == "1"
@@ -2165,6 +2191,7 @@ class ShortcutSettingsComposeDialog private constructor(
         state.lcAll.value = container.getLC_ALL()
         state.fullscreenStretched.value = container.isFullscreenStretched
         state.directComposition.value = container.isDirectCompositionEnabled()
+        state.useUnixLibs.value = container.isUseUnixLibs
 
         val startupEntries = state.startupSelectionEntries.value
         state.selectedStartupSelection.intValue = container.getStartupSelection().toInt()
@@ -2191,10 +2218,9 @@ class ShortcutSettingsComposeDialog private constructor(
         state.directXComponents.value = directX
         state.generalComponents.value = general
 
-        val envVars = EnvVars(container.getEnvVars() ?: Container.DEFAULT_ENV_VARS)
-        val items = mutableListOf<EnvVarItem>()
-        for (key in envVars) items.add(EnvVarItem(key, envVars.get(key)))
-        state.sdl2Compatibility.value = envVars.get("SDL_XINPUT_ENABLED") == "1"
+        val containerEnvVarsStr = container.getEnvVars() ?: Container.DEFAULT_ENV_VARS
+        val items = parseEnvVarItems(containerEnvVarsStr)
+        state.sdl2Compatibility.value = EnvVars(containerEnvVarsStr).get("SDL_XINPUT_ENABLED") == "1"
         state.envVars.value = if (state.sdl2Compatibility.value) {
             items.filterNot { item -> sdl2EnvVars.any { it.first == item.key } }
         } else items
@@ -2294,6 +2320,15 @@ class ShortcutSettingsComposeDialog private constructor(
 
     fun show() {
         dialog.show()
+        restorePaneNav?.invoke()
+        restorePaneNav = dialog.window?.bindPaneNav(
+            PaneNavWindowHandlers(
+                onDir = { nav.dpad(it) },
+                onActivate = { nav.dpad(PANE_DIR_ACTIVATE) },
+                onDismiss = { if (nav.onContentBack?.invoke() != true) dialog.dismiss() },
+                onStart = { nav.onSave?.invoke() },
+            )
+        )
         dialog.window?.apply {
             applyDialogLayout()
             decorView.post { applyDialogLayout() }

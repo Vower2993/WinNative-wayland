@@ -6,7 +6,6 @@ import android.graphics.BitmapFactory;
 import android.os.Handler;
 import android.os.Looper;
 import android.util.Log;
-import android.view.Choreographer;
 import android.view.Surface;
 import androidx.preference.PreferenceManager;
 import com.winlator.cmod.BuildConfig;
@@ -30,12 +29,7 @@ import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
 
-/**
- * Native Vulkan compositor.
- *
- * <p>Owns the C-side renderer handle and pushes a scene snapshot every frame. Replaces the
- * previous GLES2 {@code GLRenderer}; preserves the same public API so callers do not change.
- */
+/** Native Vulkan compositor: owns the C-side renderer handle and pushes a scene snapshot per frame. */
 public class VulkanRenderer
         implements RenderCallback,
                    WindowManager.OnWindowModificationListener,
@@ -97,21 +91,25 @@ public class VulkanRenderer
     // work when nothing changed. DRI3 allocates a fresh GPUImage per Present
     // cycle, so AHB-pointer identity is a sufficient "dirty" check.
     // Render-thread-only — no synchronization needed.
-    private long dcLastPushedAhb = 0L;
-    private int dcLastPushedW = 0;
-    private int dcLastPushedH = 0;
+    private volatile long dcLastPushedAhb = 0L;
+    private volatile int dcLastPushedW = 0;
+    private volatile int dcLastPushedH = 0;
 
     // Consecutive pushBuffer == false returns. After enough failures the
     // renderer detaches itself from the SC layer to avoid wasting JNI calls
     // every frame on a permanent failure. Render-thread-only.
-    private int dcConsecutiveFailures = 0;
+    private volatile int dcConsecutiveFailures = 0;
     private static final int DC_FAIL_LIMIT = 8;
+    // Hysteresis: stay active for a few non-qualifying frames before hiding, to prevent flapping.
+    private int dcDisengageStreak = 0;
+    private static final int DC_DISENGAGE_FRAMES = 4;
+    // While recording, keep compositing so the encoder is fed even when DC owns the display.
+    private volatile boolean recordingActive = false;
 
     // True when the most recent frame successfully pushed an AHB to the SC,
     // so the SC layer is currently visible. Used to detect transitions to
     // the windowed/multi-drawable case so we can hide the SC cleanly.
-    private boolean dcLayerActive = false;
-
+    private volatile boolean dcLayerActive = false;
     // Last skip reason logged for the DC candidate (diagnostic throttling —
     // only log when the reason CHANGES, to avoid per-frame spam). Values:
     //   "no-texture", "texture-not-gpuimage(Texture)", "gpuimage-ahb-null",
@@ -131,8 +129,9 @@ public class VulkanRenderer
     private float magnifierPanY = 0f;
     private boolean magnifierPanInitialized = false;
     private static final float MAGNIFIER_DEADZONE_FRACTION = 0.6f;
-    public int surfaceWidth;
-    public int surfaceHeight;
+    // volatile: written on the main thread, read on the render thread (buildAndSubmitFrame self-heal).
+    public volatile int surfaceWidth;
+    public volatile int surfaceHeight;
     private boolean cpuSaverMode = false;
     private static final long CURSOR_ACTIVE_NS = 100_000_000L;
     private volatile long cursorActiveUntilNs = 0L;
@@ -168,7 +167,12 @@ public class VulkanRenderer
     private final ByteBuffer sceneBuf =
             ByteBuffer.allocateDirect(SCENE_BUF_SIZE).order(ByteOrder.nativeOrder());
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    private final AtomicBoolean renderRequested = new AtomicBoolean(false);
+    // Content dirty flag — set when DRI3 delivers a new frame or input arrives.
+    private volatile boolean contentDirty = false;
+
+    public void markContentDirty() {
+        contentDirty = true;
+    }
 
     // Reusable scratch — sized once, refilled per frame.
     private final float[] sceneXform = XForm.getInstance();
@@ -186,13 +190,12 @@ public class VulkanRenderer
 
     public void destroy() {
         if (destroyed.compareAndSet(false, true)) {
-            // LEAK FIX: Unregister from the persistent XServer to prevent "zombie" listeners
+            // Unregister from the persistent XServer to avoid leaking listeners.
             xServer.windowManager.removeOnWindowModificationListener(this);
             xServer.pointer.removeOnPointerMotionListener(this);
 
             if (nativeHandle != 0) {
-                // If we are on the UI thread, nativeDestroy (which might block on vkDeviceWaitIdle)
-                // should run on a background thread to avoid freezing the UI.
+                // On the UI thread, run nativeDestroy off-thread — it may block on vkDeviceWaitIdle.
                 if (Looper.myLooper() == Looper.getMainLooper()) {
                     new Thread(() -> {
                         synchronized (this) {
@@ -217,13 +220,12 @@ public class VulkanRenderer
     }
 
     public void requestRenderCoalesced() {
-        if (renderRequested.compareAndSet(false, true)) {
-            mainHandler.post(() ->
-                    Choreographer.getInstance().postFrameCallback(frameTimeNanos -> {
-                        renderRequested.set(false);
-                        xServerView.requestRender();
-                    }));
-        }
+        xServerView.requestRender();
+    }
+
+    // Non-blocking input wake — just signals the render thread, no throttle, no direct render.
+    public void requestInputRender() {
+        xServerView.signalInputDirty();
     }
 
     private Drawable createRootCursorDrawable() {
@@ -241,27 +243,29 @@ public class VulkanRenderer
     }
 
     public void attachSurface(Surface surface) {
-        if (nativeHandle == 0) {
-            nativeHandle = nativeCreate(shouldEnableValidationLayers(),
-                    graphicsDriverName, xServerView.getContext().getApplicationContext());
+        // Serialize with detachSurface()/destroy() so a re-attach can't overlap a native teardown.
+        synchronized (this) {
             if (nativeHandle == 0) {
-                Log.e(TAG, "nativeCreate failed");
-                return;
+                nativeHandle = nativeCreate(shouldEnableValidationLayers(),
+                        graphicsDriverName, xServerView.getContext().getApplicationContext());
+                if (nativeHandle == 0) {
+                    Log.e(TAG, "nativeCreate failed");
+                    return;
+                }
+                Texture.setRendererHandle(nativeHandle);
+                // Apply the cached present-mode request (no-op if it equals the native default FIFO).
+                if (requestedPresentMode != PRESENT_MODE_FIFO) {
+                    nativeSetPresentMode(nativeHandle, requestedPresentMode);
+                }
+                if (requestedScaleFilter != SCALE_FILTER_OFF) {
+                    nativeSetScaleFilter(nativeHandle, requestedScaleFilter);
+                }
+                destroyed.set(false);
+                xServer.windowManager.addOnWindowModificationListener(this);
+                xServer.pointer.addOnPointerMotionListener(this);
             }
-            Texture.setRendererHandle(nativeHandle);
-            // Apply the cached present-mode request now that the native renderer exists.
-            // No-op if the requested mode equals the native default (FIFO).
-            if (requestedPresentMode != PRESENT_MODE_FIFO) {
-                nativeSetPresentMode(nativeHandle, requestedPresentMode);
-            }
-            if (requestedScaleFilter != SCALE_FILTER_OFF) {
-                nativeSetScaleFilter(nativeHandle, requestedScaleFilter);
-            }
-            destroyed.set(false);
-            xServer.windowManager.addOnWindowModificationListener(this);
-            xServer.pointer.addOnPointerMotionListener(this);
+            nativeSurfaceCreated(nativeHandle, surface);
         }
-        nativeSurfaceCreated(nativeHandle, surface);
     }
 
     private boolean shouldEnableValidationLayers() {
@@ -281,12 +285,60 @@ public class VulkanRenderer
     }
 
     public void detachSurface() {
-        if (nativeHandle != 0) nativeSurfaceDestroyed(nativeHandle);
+        // Same monitor as destroy()/attachSurface; re-check the handle under the lock.
+        synchronized (this) {
+            if (nativeHandle != 0) nativeSurfaceDestroyed(nativeHandle);
+        }
+    }
+
+    /** Start mirroring the composited output into {@code encoderSurface}; false if the native setup failed. */
+    public boolean startRecording(Surface encoderSurface, int fps, boolean recordUI) {
+        synchronized (this) {
+            if (nativeHandle == 0 || encoderSurface == null) return false;
+            boolean ok = nativeStartRecording(nativeHandle, encoderSurface, fps, recordUI);
+            recordingActive = ok;
+            return ok;
+        }
+    }
+
+    /** Upload the latest overlay snapshot (direct ByteBuffer of BGRA pixels) for the Record-UI composite. */
+    public void updateRecordUITexture(java.nio.ByteBuffer bgra, int width, int height) {
+        long handle = nativeHandle;
+        if (handle != 0 && bgra != null && bgra.isDirect()) {
+            nativeUpdateRecordUITexture(handle, bgra, width, height);
+        }
+    }
+
+    public void stopRecording() {
+        synchronized (this) {
+            recordingActive = false;
+            if (nativeHandle != 0) nativeStopRecording(nativeHandle);
+        }
+    }
+
+    /** Width of the actual composited image (may differ from the SurfaceView size under rotation). */
+    public int getRecordWidth() {
+        synchronized (this) {
+            return nativeHandle != 0 ? nativeGetRecordWidth(nativeHandle) : 0;
+        }
+    }
+
+    public int getRecordHeight() {
+        synchronized (this) {
+            return nativeHandle != 0 ? nativeGetRecordHeight(nativeHandle) : 0;
+        }
+    }
+
+    /** Clockwise degrees to rotate captured frames to appear upright (undoes the display rotation). */
+    public int getRecordOrientationHint() {
+        synchronized (this) {
+            return nativeHandle != 0 ? nativeGetRecordOrientationHint(nativeHandle) : 0;
+        }
     }
 
     @Override
     public void onSurfaceCreated() {
-        // Surface is already attached in attachSurface(). Nothing else to do here.
+        // Surface already attached in attachSurface().
     }
 
     @Override
@@ -312,7 +364,49 @@ public class VulkanRenderer
     // ----- Scene assembly ----------------------------------------------------
 
     private void buildAndSubmitFrame() {
-        // Compute scene transform / viewport / scissor (mirrors GLRenderer.drawFrame logic).
+        // Self-heal: if the real surface size differs from our cache (display reparent), recompute the viewport.
+        if (xServerView != null) {
+            int actualW = xServerView.getSurfaceWidth();
+            int actualH = xServerView.getSurfaceHeight();
+            if (actualW > 0 && actualH > 0 && (actualW != surfaceWidth || actualH != surfaceHeight)) {
+                surfaceWidth = actualW;
+                surfaceHeight = actualH;
+                viewTransformation.update(actualW, actualH,
+                        xServer.screenInfo.width, xServer.screenInfo.height);
+                viewportNeedsUpdate = true;
+            }
+        }
+
+        if (!contentDirty && !viewportNeedsUpdate) {
+            return;
+        }
+
+        Drawable directCandidate = findDirectCompositionCandidate();
+        boolean dcOwnsFrame = false;
+        if (directCompositionTarget != null) {
+            String candidateState = (directCandidate != null) ? "present" : "null";
+            if (!candidateState.equals(dcLastCandidateState)) {
+                dcLastCandidateState = candidateState;
+                com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
+                        directCandidate == null
+                                ? "DC: no fullscreen candidate"
+                                : "DC: fullscreen candidate " + directCandidate.width + "x" + directCandidate.height);
+            }
+            if (maybePushDirectComposition(directCandidate)) {
+                dcOwnsFrame = true;
+                dcDisengageStreak = 0;
+            } else if (dcLayerActive && ++dcDisengageStreak < DC_DISENGAGE_FRAMES) {
+                dcOwnsFrame = true;
+            } else {
+                maybeHideDirectComposition();
+                dcDisengageStreak = 0;
+            }
+        }
+        if (dcOwnsFrame && !recordingActive) {
+            contentDirty = false;
+            return;
+        }
+
         textureUploadBatch.reset();
         boolean useScissor = false;
 
@@ -337,7 +431,6 @@ public class VulkanRenderer
 
         final ByteBuffer buf = sceneBuf;
 
-        // Viewport
         int viewX, viewY, viewW, viewH;
         if (fullscreen) {
             viewX = 0;
@@ -355,23 +448,28 @@ public class VulkanRenderer
         buf.putInt(OFF_VIEWPORT + 8,  viewW);
         buf.putInt(OFF_VIEWPORT + 12, viewH);
 
-        // Scissor (only in non-magnifier non-fullscreen mode)
+        // Scissor (non-magnifier non-fullscreen): clamp to the framebuffer so a ZOOM/crop viewport overflow never yields an out-of-bounds scissor.
         if (useScissor) {
+            int sX = Math.max(0, viewTransformation.viewOffsetX);
+            int sY = Math.max(0, viewTransformation.viewOffsetY);
+            int sRight = Math.min(surfaceWidth, viewTransformation.viewOffsetX + viewTransformation.viewWidth);
+            int sBottom = Math.min(surfaceHeight, viewTransformation.viewOffsetY + viewTransformation.viewHeight);
+            int sW = Math.max(0, sRight - sX);
+            int sH = Math.max(0, sBottom - sY);
             buf.putInt(OFF_SCISSOR_ENABLED, 1);
-            buf.putInt(OFF_SCISSOR,      viewTransformation.viewOffsetX);
-            buf.putInt(OFF_SCISSOR + 4,  viewTransformation.viewOffsetY);
-            buf.putInt(OFF_SCISSOR + 8,  viewTransformation.viewWidth);
-            buf.putInt(OFF_SCISSOR + 12, viewTransformation.viewHeight);
+            buf.putInt(OFF_SCISSOR,      sX);
+            buf.putInt(OFF_SCISSOR + 4,  sY);
+            buf.putInt(OFF_SCISSOR + 8,  sW);
+            buf.putInt(OFF_SCISSOR + 12, sH);
         } else {
             buf.putInt(OFF_SCISSOR_ENABLED, 0);
-            // Native side gates on scissor_enabled regardless, but zero the rect for cleanliness.
+            // Native gates on scissor_enabled anyway; zero the rect for cleanliness.
             buf.putInt(OFF_SCISSOR,      0);
             buf.putInt(OFF_SCISSOR + 4,  0);
             buf.putInt(OFF_SCISSOR + 8,  0);
             buf.putInt(OFF_SCISSOR + 12, 0);
         }
 
-        // XForm
         buf.putFloat(OFF_XFORM,      sceneXform[0]);
         buf.putFloat(OFF_XFORM + 4,  sceneXform[1]);
         buf.putFloat(OFF_XFORM + 8,  sceneXform[2]);
@@ -381,7 +479,7 @@ public class VulkanRenderer
 
         viewportNeedsUpdate = false;
 
-        // Collect renderable windows (matches GLRenderer.renderWindows occlusion skipping).
+        // Collect renderable windows (occlusion skipping).
         int winCount = 0;
         long cursorHandle = 0;
         boolean cursorOnscreen = false;
@@ -389,10 +487,6 @@ public class VulkanRenderer
         int sourceW = 0;
         int sourceH = 0;
         int sourceArea = 0;
-        // Track the direct-scanout candidate Drawable (the largest window
-        // matching screen size) so we can push its AHB to the SurfaceControl
-        // after the VulkanRenderer composition. Render-thread-only.
-        Drawable directCandidate = null;
 
         try (XLock lock = xServer.lock(XServer.Lockable.WINDOW_MANAGER, XServer.Lockable.DRAWABLE_MANAGER)) {
             int screenW = xServer.screenInfo.width;
@@ -426,6 +520,7 @@ public class VulkanRenderer
                         scanoutX = 0;
                         scanoutY = 0;
                     }
+                    if (textureSrc == drawable && !drawable.hasContent()) continue;
                     tex = textureSrc.getTexture();
                     if (tex != null) {
                         tex.appendUploadFromDrawable(textureSrc, textureUploadBatch);
@@ -450,8 +545,6 @@ public class VulkanRenderer
                     sourceW = candidateW;
                     sourceH = candidateH;
                     sourceArea = candidateArea;
-                    // Track the Drawable for the Direct Composition push.
-                    directCandidate = drawable;
                 }
                 if (!loggedAhbSceneUse && tex instanceof GPUImage && ApplicationLogGate.isEnabled()) {
                     Log.i(TAG, "Submitting AHB-backed texture in Vulkan scene: windowCount="
@@ -535,7 +628,6 @@ public class VulkanRenderer
         buf.putInt(OFF_SOURCE_W, sourceW);
         buf.putInt(OFF_SOURCE_H, sourceH);
 
-        // Effects snapshot
         Effect[] active = effectComposer.snapshot();
         int effectCount = Math.min(active.length, MAX_EFFECTS);
         buf.putInt(OFF_EFFECT_COUNT, effectCount);
@@ -550,41 +642,27 @@ public class VulkanRenderer
         }
 
         nativeSetScene(nativeHandle, buf);
-        // nativeSetFpsLimit is a native no-op (pacing is done elsewhere); not called per frame.
         nativeRenderFrame(nativeHandle);
+        contentDirty = false;
+    }
 
-        // === DIRECT COMPOSITION per-frame hook ===
-        // After the VulkanRenderer composition, push the fullscreen candidate's
-        // AHardwareBuffer to the SurfaceControl layer (if attached and the
-        // candidate qualifies). The SC layer at z=1 covers the VulkanRenderer's
-        // output at z=0; HWC promotes it to a DPU overlay plane — zero GPU
-        // compositing cost, zero buffer copy. If no candidate qualifies, hide
-        // the SC layer (transition back to VulkanRenderer composition).
-        if (directCompositionTarget != null) {
-            // Throttled diagnostic: log when the candidate-null state changes,
-            // so we can see whether any window ever qualifies.
-            String candidateState = (directCandidate != null) ? "present" : "null";
-            if (!candidateState.equals(dcLastCandidateState)) {
-                dcLastCandidateState = candidateState;
-                if (directCandidate == null) {
-                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
-                            "DC: no fullscreen direct-scanout candidate this frame "
-                                    + "(winCount=" + winCount + " sourceW=" + sourceW
-                                    + " sourceH=" + sourceH + " screenW="
-                                    + xServer.screenInfo.width + " screenH="
-                                    + xServer.screenInfo.height + ")");
-                } else {
-                    com.winlator.cmod.runtime.display.composition.SurfaceCompositor.logEvent(
-                            "DC: fullscreen direct-scanout candidate detected "
-                                    + "(drawable=" + directCandidate.width + "x"
-                                    + directCandidate.height + " sourceW=" + sourceW
-                                    + " sourceH=" + sourceH + ")");
+    // Geometry-only scan for the fullscreen DC candidate (no Vulkan import).
+    private Drawable findDirectCompositionCandidate() {
+        Drawable candidate = null;
+        try (XLock lock = xServer.lock(XServer.Lockable.WINDOW_MANAGER, XServer.Lockable.DRAWABLE_MANAGER)) {
+            int screenW = xServer.screenInfo.width;
+            int screenH = xServer.screenInfo.height;
+            for (int i = 0; i < renderableWindows.size(); i++) {
+                RenderableWindow rw = renderableWindows.get(i);
+                Drawable d = rw.content;
+                if (d != null && rw.rootX == 0 && rw.rootY == 0
+                        && Short.toUnsignedInt(d.width) >= screenW
+                        && Short.toUnsignedInt(d.height) >= screenH) {
+                    candidate = d;
                 }
             }
-            if (!maybePushDirectComposition(directCandidate)) {
-                maybeHideDirectComposition();
-            }
         }
+        return candidate;
     }
 
     /**
@@ -618,19 +696,18 @@ public class VulkanRenderer
         if (dcTarget == null) return false;
         if (surfaceWidth <= 0 || surfaceHeight <= 0) return false;
 
-        // Force fallback to VulkanRenderer composition when an in-process
-        // overlay needs to be visible on top of the game frame. The SC layer
-        // at z=1 covers the VulkanRenderer's output at z=0, so anything we
-        // composite via VulkanRenderer (magnifier UI, debug HUDs, cursor)
-        // would otherwise be invisible.
+        // Force fallback to VulkanRenderer composition when the magnifier UI is
+        // active — the z=1 SC layer would otherwise cover it.
         if (magnifierUIActive) {
             return false;
         }
         // No fullscreen candidate — fall back to VulkanRenderer.
         if (directCandidate == null) {
-            // Log once when we first see no candidate (diagnostic — helps
-            // distinguish "no game window yet" from "game window exists but
-            // isn't AHB-backed"). Throttled by dcLayerActive to avoid spam.
+            return false;
+        }
+        // Only direct-scan a screen-covering window (don't stretch a sub-window fullscreen).
+        if (Short.toUnsignedInt(directCandidate.width) < xServer.screenInfo.width
+                || Short.toUnsignedInt(directCandidate.height) < xServer.screenInfo.height) {
             return false;
         }
 
@@ -669,9 +746,15 @@ public class VulkanRenderer
                 }
             }
 
-            if (!(tex instanceof GPUImage)) return false;
+            if (!(tex instanceof GPUImage)) {
+                drainFenceFd(scanoutSource);
+                return false;
+            }
             long ahbPtr = ((GPUImage) tex).getHardwareBufferPtr();
-            if (ahbPtr == 0L) return false;
+            if (ahbPtr == 0L) {
+                drainFenceFd(scanoutSource);
+                return false;
+            }
 
             // Skip JNI when nothing has changed since the last push.
             // SurfaceFlinger is still showing the layer; no point queueing a
@@ -682,32 +765,9 @@ public class VulkanRenderer
                 return true;
             }
 
-            // === VSYNC PACING ===
-            // Before pushing a NEW frame, wait for the PREVIOUS frame's
-            // ASurfaceTransaction to complete (the buffer is on display).
-            // This paces the render thread to SurfaceFlinger's vsync rate,
-            // eliminating the per-frame apply() storm that wastes CPU and
-            // battery. We hold the renderLock across the wait so the X-server
-            // worker thread can't swap the scanoutSource out from under us.
-            //
-            // Timeout: 20ms (~1 vsync at 60Hz, ~8ms at 120Hz). If SF is slow
-            // (e.g., heavy composition), we proceed anyway — a queued
-            // transaction is better than a frozen render thread.
-            //
-            // Only wait when we have a previously-pushed frame (dcLastPushedAhb
-            // != 0). The first frame has nothing to wait for.
-            if (dcLastPushedAhb != 0L) {
-                dcTarget.waitForPreviousFrame(20L);
-            }
-
-            // Producer-acquire fence: TAKE the FD from the scanout source
-            // under the renderLock, atomically clearing it. We are now the
-            // single owner; if pushBuffer succeeds, the framework closes the
-            // FD via setBuffer; if pushBuffer fails, the JNI layer closes the
-            // FD on its own error paths.
             int fenceFd = scanoutSource.takeAcquireFenceFd();
             boolean ok = dcTarget.pushBuffer(ahbPtr, 0, 0,
-                    surfaceWidth, surfaceHeight, fenceFd, /*opaque=*/true);
+                    surfaceWidth, surfaceHeight, fenceFd, /*opaque=*/true, /*pace=*/true);
             if (ok) {
                 dcLastPushedAhb = ahbPtr;
                 dcLastPushedW = surfaceWidth;
@@ -760,6 +820,16 @@ public class VulkanRenderer
      * Idempotent and cheap after the first call: tracks dcLayerActive so we
      * only queue a hide-transaction once per direct→fallback transition.
      */
+    // Drain unconsumed fence FD to prevent FD leak when DC can't handle a frame.
+    private void drainFenceFd(Drawable scanoutSource) {
+        if (scanoutSource == null) return;
+        int fd = scanoutSource.takeAcquireFenceFd();
+        if (fd >= 0) {
+            try { android.os.ParcelFileDescriptor.adoptFd(fd).close(); }
+            catch (java.io.IOException ignored) {}
+        }
+    }
+
     private void maybeHideDirectComposition() {
         if (!dcLayerActive) return;
         com.winlator.cmod.runtime.display.composition.DirectCompositionLayer dcTarget =
@@ -784,16 +854,18 @@ public class VulkanRenderer
      */
     public void setDirectCompositionTarget(
             com.winlator.cmod.runtime.display.composition.DirectCompositionLayer layer) {
+        // Hide old layer before swapping to prevent stale frame on screen.
+        com.winlator.cmod.runtime.display.composition.DirectCompositionLayer old = directCompositionTarget;
+        if (dcLayerActive && old != null) {
+            old.hide();
+        }
         this.directCompositionTarget = layer;
-        // Invalidate cache so the first frame after attach pushes regardless.
         dcLastPushedAhb = 0L;
         dcLastPushedW = 0;
         dcLastPushedH = 0;
         dcConsecutiveFailures = 0;
         dcLayerActive = false;
-        dcLastSkipReason = "";  // reset so next frame logs fresh skip reason
-        // Notify the listener that DC state may have changed (target attached
-        // or detached). The activity uses this to update the HUD indicator.
+        dcLastSkipReason = "";
         notifyDirectCompositionStateListener();
     }
 
@@ -835,12 +907,24 @@ public class VulkanRenderer
 
     @Override
     public void onUpdateWindowContent(Window window) {
+        contentDirty = true;
         requestRenderCoalesced();
     }
 
     @Override
     public void onUpdateWindowGeometry(final Window window, boolean resized) {
         if (resized) {
+            // Graphics preset change: flush DC state, invalidate cache, force re-evaluation.
+            com.winlator.cmod.runtime.display.composition.DirectCompositionLayer dcGeom = directCompositionTarget;
+            if (dcLayerActive && dcGeom != null) {
+                dcGeom.hide();
+                dcLayerActive = false;
+                notifyDirectCompositionStateListener();
+            }
+            dcLastPushedAhb = 0L;
+            dcLastPushedW = 0;
+            dcLastPushedH = 0;
+            dcLastSkipReason = "";
             xServerView.queueEvent(this::updateScene);
         } else {
             xServerView.queueEvent(() -> updateWindowPosition(window));
@@ -865,7 +949,8 @@ public class VulkanRenderer
 
     @Override
     public void onPointerMove(short x, short y) {
-        requestCursorRender();
+        cursorActiveUntilNs = System.nanoTime() + CURSOR_ACTIVE_NS;
+        requestInputRender();
     }
 
     @Override
@@ -883,6 +968,7 @@ public class VulkanRenderer
                     xServer.windowManager.rootWindow.getX(),
                     xServer.windowManager.rootWindow.getY());
         }
+        contentDirty = true;
     }
 
     private void collectRenderableWindows(Window window, int x, int y) {
@@ -916,7 +1002,7 @@ public class VulkanRenderer
         }
     }
 
-    // ----- Public API (matches the previous GLRenderer) ---------------------
+    // ----- Public API -------------------------------------------------------
 
     public EffectComposer getEffectComposer() { return effectComposer; }
 
@@ -1047,6 +1133,45 @@ public class VulkanRenderer
     public boolean isViewportNeedsUpdate() { return viewportNeedsUpdate; }
     public void setViewportNeedsUpdate(boolean v) { this.viewportNeedsUpdate = v; }
 
+    // Fill mode (FIT/STRETCH/ZOOM), applied live: recompute the viewport and request a frame.
+    public void setFillMode(int mode) {
+        if (viewTransformation.mode == mode) return;
+        viewTransformation.mode = mode;
+        if (surfaceWidth > 0 && surfaceHeight > 0) {
+            viewTransformation.update(surfaceWidth, surfaceHeight,
+                    xServer.screenInfo.width, xServer.screenInfo.height);
+        }
+        viewportNeedsUpdate = true;
+        if (xServerView != null) xServerView.requestRender();
+    }
+
+    public int getFillMode() { return viewTransformation.mode; }
+
+    // Set the fill mode without recomputing the viewport (cached size may be stale mid-reparent).
+    public void setFillModeQuiet(int mode) {
+        viewTransformation.mode = mode;
+        viewportNeedsUpdate = true;
+    }
+
+    public int getPresentMode() { return requestedPresentMode; }
+
+    // Wipe the cached surface size so the next surfaceChanged/self-heal recomputes from scratch.
+    public void invalidateSurfaceSize() {
+        surfaceWidth = 0;
+        surfaceHeight = 0;
+        viewportNeedsUpdate = true;
+    }
+
+    /** Force the viewport to recompute against a known surface size (used after a display reparent). */
+    public void forceViewportRecompute(int w, int h) {
+        if (w <= 0 || h <= 0) return;
+        surfaceWidth = w;
+        surfaceHeight = h;
+        viewTransformation.update(w, h, xServer.screenInfo.width, xServer.screenInfo.height);
+        viewportNeedsUpdate = true;
+        if (xServerView != null) xServerView.requestRender();
+    }
+
     public void setNativeMode(boolean enable) {
         if (cpuSaverMode != enable) {
             cpuSaverMode = enable;
@@ -1080,9 +1205,7 @@ public class VulkanRenderer
     public static final int PRESENT_MODE_MAILBOX   = 1;
     public static final int PRESENT_MODE_IMMEDIATE = 2;
 
-    // Cached so callers can set a mode before the native renderer exists. Applied during
-    // attachSurface() right after nativeCreate. Updates after init forward straight to the
-    // native side and trigger a swapchain rebuild.
+    // Cached so a mode can be set before the native renderer exists (applied in attachSurface).
     private int requestedPresentMode = PRESENT_MODE_FIFO;
 
     public void setPresentMode(int mode) {
@@ -1120,8 +1243,7 @@ public class VulkanRenderer
     }
 
     public void enforceFpsLimit() {
-        // FPS limiting is now performed in native (after queue submit/present), so this
-        // method is a no-op kept for source compatibility with any external callers.
+        // No-op: FPS limiting now runs in native (after submit/present); kept for source compatibility.
     }
 
     // ---- JNI ---------------------------------------------------------------
@@ -1133,6 +1255,12 @@ public class VulkanRenderer
     private static native void nativeSurfaceCreated(long handle, Surface surface);
     private static native void nativeSurfaceChanged(long handle, int w, int h);
     private static native void nativeSurfaceDestroyed(long handle);
+    private static native boolean nativeStartRecording(long handle, Surface encoderSurface, int fps, boolean recordUI);
+    private static native void nativeStopRecording(long handle);
+    private static native void nativeUpdateRecordUITexture(long handle, java.nio.ByteBuffer bgra, int width, int height);
+    private static native int nativeGetRecordWidth(long handle);
+    private static native int nativeGetRecordHeight(long handle);
+    private static native int nativeGetRecordOrientationHint(long handle);
     private static native boolean nativeRenderFrame(long handle);
     private static native void nativeSetScene(long handle, ByteBuffer sceneBuf);
     private static native void nativeSetFpsLimit(long handle, int fps);
